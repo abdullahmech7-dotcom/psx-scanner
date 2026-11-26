@@ -1,7 +1,7 @@
 streamlit>=1.35
-pandas>=2.0
-numpy>=1.24
-matplotlib>=3.7
-pypsx-toolkit
+pandas
+numpy
+matplotlib
 rich
-yfinance>=0.2.40
+pypsx-toolkit
+yfinance>=0.2.54
