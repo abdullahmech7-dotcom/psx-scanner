@@ -54,13 +54,18 @@ if mode=='Market scan':
     st.info(f'Scanning up to {scan_limit} PSX tickers. The results depend on available data sources; unavailable symbols are omitted.')
     if st.button('🚀 Scan PSX market',type='primary'):
         with st.spinner('Downloading market data and calculating technical setups...'):
-            results=run_scan(tuple(ps.PSX_UNIVERSE[:scan_limit]),horizon_key,workers,include_news)
-        if not results: st.error('No usable data returned. Try again later or use Single stock mode.');st.stop()
+            try:
+                results=run_scan(tuple(ps.PSX_UNIVERSE[:scan_limit]),horizon_key,workers,include_news)
+            except Exception as e:
+                st.error(f'Scan failed safely: {type(e).__name__}: {e}')
+                results=[]
+        if not results: st.error('No usable data returned, or all symbols failed. Please try again later.');st.stop()
         st.session_state['scan_results']=results
     results=st.session_state.get('scan_results')
     if results:
         df=pd.DataFrame([{k:r[k] for k in ['symbol','signal','score','price','trend','rsi','volume_ratio','risk_reward','news_risk']} for r in results])
-        df=df.sort_values(['signal','score'],ascending=[True,False])
+        # Preserve the scanner's rank order instead of alphabetically sorting signal names.
+        df=df.reset_index(drop=True)
         st.subheader('Ranked scan results')
         st.dataframe(df.rename(columns={'symbol':'Ticker','signal':'Signal','score':'Score','price':'Price','trend':'Trend','rsi':'RSI','volume_ratio':'Vol x','risk_reward':'R:R','news_risk':'News risk'}),use_container_width=True,hide_index=True)
         st.download_button('Download results CSV',df.to_csv(index=False).encode(),file_name='psx_scan.csv',mime='text/csv')
@@ -75,7 +80,11 @@ else:
     sym=st.text_input('PSX ticker',value='OGDC').strip().upper()
     if st.button('Analyze ticker',type='primary'):
         with st.spinner(f'Analyzing {sym}...'):
-            r=ps.analyse(sym,horizon_key,include_news=include_news)
+            try:
+                r=ps.analyse(sym,horizon_key,include_news=include_news)
+            except Exception as e:
+                st.error(f'Analysis failed safely: {type(e).__name__}: {e}')
+                r=None
         if not r:st.error('Could not retrieve usable PSX data for this ticker.');st.stop()
         st.session_state['single']=r
     r=st.session_state.get('single')
