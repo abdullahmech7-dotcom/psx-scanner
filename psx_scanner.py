@@ -128,42 +128,80 @@ def candles_from(raw, rule):
     return out.dropna(subset=["close"])
 
 
-def load_live(sym):
-    try:
-        import pypsx_toolkit as pt
-    except ImportError:
-        sys.exit("Install first:  pip install pypsx-toolkit")
-    t = pt.PSXTicker(sym)
+
+DATA_ERR = []          # reasons the data sources failed (shown to the user)
+
+
+def _err(msg):
+    if msg not in DATA_ERR:
+        DATA_ERR.append(msg)
+    del DATA_ERR[8:]
+
+
+def psx_portal(kind, sym):
+    """Official PSX data portal (same source many PSX tools use). kind: 'eod' (daily) or 'int' (intraday ticks)."""
+    import json
+    url = f"https://dps.psx.com.pk/timeseries/{kind}/{sym}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://dps.psx.com.pk/", "Accept": "application/json"})
+    js = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "ignore"))
+    rows = js.get("data") if isinstance(js, dict) else js
+    if not rows:
+        raise ValueError("portal returned no rows")
+    if kind == "eod":                                  # [timestamp, close, volume, open]
+        cols = ["timestamp", "close", "volume", "open"][:len(rows[0])]
+    else:                                              # [timestamp, price, volume]
+        cols = ["timestamp", "price", "volume"][:len(rows[0])]
+    df = _norm(pd.DataFrame(rows, columns=cols))
+    if kind == "eod":
+        idx = pd.DatetimeIndex(df.index)
+        df.index = (idx.tz_localize(None) if idx.tz is not None else idx).normalize()
+        df = df[~df.index.duplicated(keep="last")]
+    return df
+
+
+def daily_chain(sym):
+    """Daily candles for one PSX stock: pypsx-toolkit -> PSX portal -> Yahoo (.KA). Returns DataFrame or None."""
     end = pd.Timestamp.today().normalize()
     start = end - pd.Timedelta(days=730)
-    fmt_ = "%Y-%m-%d"
-    tries = (lambda: t.get_historical(start_date=start.strftime(fmt_), end_date=end.strftime(fmt_)),
-             lambda: t.history(period="2y", interval="1d"))
-    daily, partial = None, None
-    for fn in tries:
+    srcs = []
+    try:
+        import pypsx_toolkit as pt
+        t = pt.PSXTicker(sym)
+        srcs += [("pypsx-toolkit", lambda: t.get_historical(start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d"))),
+                 ("pypsx-toolkit history", lambda: t.history(period="2y", interval="1d"))]
+    except Exception as e:
+        _err(f"pypsx-toolkit not usable: {str(e)[:80]}")
+    srcs += [("PSX portal", lambda: psx_portal("eod", sym)),
+             ("Yahoo", lambda: yf_batch([sym + ".KA"], "1d", "5y")[sym + ".KA"])]
+    for name, fn in srcs:
         try:
             cand = _norm(fn())
+            if {"open", "close"} <= set(cand.columns) and len(cand) >= 20:
+                return _ohlcv(cand, allow_synth=True)
         except Exception as e:
-            print(f"[!] daily source failed: {e}")
-            continue
-        print("    daily columns:", list(cand.columns))
-        if {"open", "high", "low", "close"} <= set(cand.columns):
-            daily = _ohlcv(cand)
-            break
-        partial = partial if partial is not None else cand
-    if daily is None:
-        if partial is None:
-            sys.exit(f"Could not download daily data for {sym}. Check the symbol name.")
-        print("[!] This data source has no high/low. Wicks are approximated from open/close:\n"
-              "    candlestick patterns and ATR/stop-loss are LESS reliable on 1D. Intraday TFs are unaffected.")
-        daily = _ohlcv(partial, allow_synth=True)
+            _err(f"{name}: {str(e)[:90]}")
+    return None
+
+
+def load_live(sym):
     global INTRADAY_ERR
+    daily = daily_chain(sym)
+    if daily is None:
+        sys.exit(f"Could not download daily data for {sym} from any source. Tried: pypsx-toolkit, PSX portal, Yahoo. Reasons: "
+                 + " | ".join(DATA_ERR or ["unknown"]))
     raw, INTRADAY_ERR = None, None
     try:
-        raw = _norm(t.intraday())
+        import pypsx_toolkit as pt
+        raw = _norm(pt.PSXTicker(sym).intraday())
     except Exception as e:
         INTRADAY_ERR = str(e)[:160]
-        print(f"[!] Intraday data unavailable for {sym}: {e}")
+    if raw is None or not len(raw):
+        try:
+            raw = psx_portal("int", sym)
+            INTRADAY_ERR = None
+        except Exception as e:
+            INTRADAY_ERR = (INTRADAY_ERR or "") + f" | portal: {str(e)[:80]}"
+            raw = None
     return daily, raw
 
 
@@ -861,22 +899,7 @@ def draw(sym, r, show=True, fig_only=False):
 # ------------------------------------------------------------------ MARKET-WIDE INTRADAY SCANNER
 def load_daily(sym):
     """Daily bars only, quiet. Returns DataFrame or None."""
-    try:
-        import pypsx_toolkit as pt
-        t = pt.PSXTicker(sym)
-        end = pd.Timestamp.today().normalize()
-        start = end - pd.Timedelta(days=500)
-        for fn in (lambda: t.get_historical(start_date=start.strftime("%Y-%m-%d"), end_date=end.strftime("%Y-%m-%d")),
-                   lambda: t.history(period="2y", interval="1d")):
-            try:
-                cand = _norm(fn())
-            except Exception:
-                continue
-            if {"open", "close"} <= set(cand.columns):
-                return _ohlcv(cand, allow_synth=True)
-    except Exception:
-        pass
-    return None
+    return daily_chain(sym)
 
 
 def list_symbols():
@@ -928,6 +951,10 @@ def fetch_ticks(sym, demo):
         except Exception as e:
             TICK_ERR.setdefault("first", f"{sym}: {str(e)[:120]}")
             time.sleep(0.6)
+    try:
+        return psx_portal("int", sym)
+    except Exception as e:
+        TICK_ERR.setdefault("portal", f"{sym}: {str(e)[:100]}")
     return None
 
 
@@ -1830,7 +1857,7 @@ def scan_best(market, style, hold_min, top=10, demo=False, custom=None, min_turn
         ctx = demo_news_bundle() if demo else get_news_bundle(market, "", None, asset=False)
     last_ts = max((o["last_ts"] for o in opps), default=None)
     return dict(market=market, style=style, hold_min=hold_min, ranked=ranked, watch=watch, avoid=avoid, uni=uni, n=len(opps),
-                skipped=skipped, ctx=ctx, last_ts=last_ts, fallback_n=fb, feed_err=TICK_ERR.get('first'), secs=time.time() - t0, demo=demo)
+                skipped=skipped, ctx=ctx, last_ts=last_ts, fallback_n=fb, feed_err=(TICK_ERR.get('first') or TICK_ERR.get('portal')), secs=time.time() - t0, demo=demo)
 
 
 # ------------------------------------------------------------------ main
