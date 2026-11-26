@@ -915,6 +915,9 @@ def load_demo_ticks(sym):
     return pd.DataFrame(rows, columns=["time", "price", "volume"]).set_index("time")
 
 
+TICK_ERR = {}
+
+
 def fetch_ticks(sym, demo):
     if demo:
         return load_demo_ticks(sym)
@@ -922,7 +925,8 @@ def fetch_ticks(sym, demo):
     for _ in range(2):
         try:
             return _norm(pt.PSXTicker(sym).intraday())
-        except Exception:
+        except Exception as e:
+            TICK_ERR.setdefault("first", f"{sym}: {str(e)[:120]}")
             time.sleep(0.6)
     return None
 
@@ -1334,7 +1338,7 @@ def yf_batch(tickers, interval, period):
 
 
 def yf_frames(tickers, style, progress=None):
-    plan = [("5m", "30d"), ("1h", "120d"), ("1d", "1y")] if style == "Intraday" else [("1h", "180d"), ("1d", "3y")]
+    plan = [("5m", "59d"), ("1h", "365d"), ("1d", "5y")] if style == "Intraday" else [("1h", "365d"), ("1d", "5y")]
     frames = {t: {} for t in tickers}
     for k, (iv, per) in enumerate(plan):
         for t, df in yf_batch(tickers, iv, per).items():
@@ -1377,28 +1381,35 @@ def demo_frames(sym, market, style):
 
 # ---------- PSX frames
 def psx_frames(sym, style, demo=False, min_turnover=0):
-    """Returns (frames, reason_if_skipped). Intraday: ticks only (daily added later for top candidates). Swing: daily only."""
-    frames = {}
+    """Returns (frames, reason_if_skipped). Intraday: PSX ticks, else Yahoo .KA 5m history, else DAILY history (previous days)."""
     if style == "Swing":
         d = load_demo(sym)[0] if demo else load_daily(sym)
         if d is None or len(d) < MIN_BARS["1D"]:
             return None, "no daily data"
         return {"1D": d}, None
-    raw = fetch_ticks(sym, demo)
-    if raw is None or not len(raw):
-        return None, "no intraday data"
-    try:
-        for tf, rule in (("5m", "5min"), ("15m", "15min"), ("30m", "30min"), ("1h", "60min")):
-            frames[tf] = candles_from(raw, rule)
-    except Exception:
-        return None, "bad data"
-    c5 = frames["5m"]
-    if len(c5) < MIN_BARS["5m"]:
-        return None, "too few candles"
-    day = np.asarray(c5.index.date)
-    if c5.volume.sum() > 0 and float((c5.close * c5.volume)[day == day[-1]].sum()) < min_turnover:
-        return None, "illiquid"
-    return frames, None
+    frames, raw = {}, fetch_ticks(sym, demo)
+    if raw is not None and len(raw):
+        try:
+            for tf, rule in (("5m", "5min"), ("15m", "15min"), ("30m", "30min"), ("1h", "60min")):
+                frames[tf] = candles_from(raw, rule)
+        except Exception:
+            frames = {}
+    if not frames and not demo:                                   # backup source: Yahoo (not every PSX stock exists there)
+        try:
+            y = yf_frames([sym + ".KA"], "Intraday")[sym + ".KA"]
+            frames = {k: v for k, v in y.items() if k != "1D"}
+        except Exception:
+            frames = {}
+    if frames and len(frames.get("5m", [])) >= MIN_BARS["5m"]:
+        c5 = frames["5m"]
+        day = np.asarray(c5.index.date)
+        if c5.volume.sum() > 0 and float((c5.close * c5.volume)[day == day[-1]].sum()) < min_turnover:
+            return None, "illiquid"
+        return frames, None
+    d = load_demo(sym)[0] if demo else load_daily(sym)             # market closed / feed empty: use previous days (daily candles)
+    if d is not None and len(d) >= MIN_BARS["1D"]:
+        return {"1D": d, "_daily_only": True}, None
+    return None, "no intraday data"
 
 
 # ---------- news (stock / sector / market / macro / world)
@@ -1718,14 +1729,16 @@ def analyse_symbol(market, sym, style, hold_min, name=None, news=True, demo=Fals
         out["tick_info"] = f"Data: {', '.join(f'{k} {len(v)} candles' for k, v in frames.items())}"
     if style == "Swing" and not any(r["tf"] in ("1h", "1D") for r in results):
         raise ValueError("No hourly or daily candles available for a swing analysis.")
+    fb = False
     if style == "Intraday" and not any(r["kind"] == "Intraday" for r in results):
-        raise ValueError("No intraday candles available yet (market closed or feed empty). Try Swing mode, or retry in market hours.")
+        style, hold_min, fb = "Swing", SESSION_MIN[market], True     # market closed / feed empty: analyse previous days instead
     opp = build_opportunity(shown, market, results, style, hold_min, demo)
+    opp["fallback"] = fb
     nb = None
     if news:
         nb = demo_news_bundle() if demo else get_news_bundle(market, shown, name)
         apply_news(opp, nb)
-    out.update(sym=shown, results=results, why=why, opp=opp, nw=nb)
+    out.update(sym=shown, results=results, why=why, opp=opp, nw=nb, fallback=fb)
     return out
 
 
@@ -1767,7 +1780,11 @@ def scan_best(market, style, hold_min, top=10, demo=False, custom=None, min_turn
     def evaluate_one(s, fr):
         res, _ = analyse_frames(fr)
         if style == "Intraday" and not any(r["kind"] == "Intraday" for r in res):
-            return None
+            if not res:
+                return None
+            o = build_opportunity(s, market, res, "Swing", SESSION_MIN[market], demo)   # no live candles: plan from previous days
+            o["fallback"] = True
+            return o
         return build_opportunity(s, market, res, style, hold_min, demo) if res else None
 
     for k, (s, fr) in enumerate(framesets.items()):
@@ -1807,12 +1824,13 @@ def scan_best(market, style, hold_min, top=10, demo=False, custom=None, min_turn
     rest = [o for o in opps if id(o) not in top_ids]
     watch = sorted([o for o in rest if o["final"] >= 20 or (market not in LONG_ONLY and o["final"] <= -20)], key=lambda o: -abs(o["final"]))[:8]
     avoid = sorted([o for o in opps if market in LONG_ONLY and o["side"] < 0], key=lambda o: o["final"])[:6]
+    fb = sum(1 for o in opps if o.get("fallback"))
     ctx = None
     if want_news:
         ctx = demo_news_bundle() if demo else get_news_bundle(market, "", None, asset=False)
     last_ts = max((o["last_ts"] for o in opps), default=None)
     return dict(market=market, style=style, hold_min=hold_min, ranked=ranked, watch=watch, avoid=avoid, uni=uni, n=len(opps),
-                skipped=skipped, ctx=ctx, last_ts=last_ts, secs=time.time() - t0, demo=demo)
+                skipped=skipped, ctx=ctx, last_ts=last_ts, fallback_n=fb, feed_err=TICK_ERR.get('first'), secs=time.time() - t0, demo=demo)
 
 
 # ------------------------------------------------------------------ main
