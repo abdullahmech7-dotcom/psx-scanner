@@ -1568,9 +1568,13 @@ def tf_weights(style, hold_min, market):
     return {"1h": .6, "1D": .4} if hold_min / SESSION_MIN[market] <= 2 else {"1D": .75, "1h": .25}
 
 
-def fit_plan(p, side, hold_bars):
-    """Fit stop + targets to the holding time: stop no wider than what price can cover (reach/1.2), T1 = 1.5R capped at reach."""
+def fit_plan(p, side, hold_bars, nextday=False):
+    """Fit stop + targets to the holding time: stop no wider than what price can cover (reach/1.2), T1 = 1.5R capped at reach.
+    nextday=True: intraday plan for the next session built from DAILY candles (stop ~0.5 daily range, T1 1.5R, T2 2.5R)."""
     a, e = p["atr"], p["entry"]
+    if nextday:
+        r = max(0.4 * a, min(p["risk"], 0.5 * a))
+        return dict(entry=e, sl=e - side * r, risk=r, atr=a, t1=e + side * 1.5 * r, t2=e + side * 2.5 * r, tm=1.5), True
     reach = 0.7 * a * np.sqrt(hold_bars)
     r = max(a, min(p["risk"], reach / 1.2))
     d1 = min(1.5 * r, reach)
@@ -1579,7 +1583,7 @@ def fit_plan(p, side, hold_bars):
     return q, adapted
 
 
-def backtest_plan(d, sc, side, H, hold_bars):
+def backtest_plan(d, sc, side, H, hold_bars, nextday=False):
     """Past signals of the same kind: did T1 hit before SL within H bars (same fitted plan rules)?"""
     idx = np.where(sc.values >= THR)[0] if side > 0 else np.where(sc.values <= -THR)[0]
     prev, hi, lo = set(idx), d.high.values, d.low.values
@@ -1587,7 +1591,7 @@ def backtest_plan(d, sc, side, H, hold_bars):
     for i in idx:
         if i < 30 or (i - 1) in prev or i + H >= len(d):
             continue
-        p, _ = fit_plan(make_plan(d, i, side), side, hold_bars)
+        p, _ = fit_plan(make_plan(d, i, side), side, hold_bars, nextday)
         res = "t"
         for j in range(i + 1, i + 1 + H):
             if side > 0:
@@ -1609,7 +1613,7 @@ def pattern_points(chart):
     return pts
 
 
-def build_opportunity(sym, market, results, style, hold_min, demo=False):
+def build_opportunity(sym, market, results, style, hold_min, demo=False, nextday=False):
     """Turns analysed timeframes into ONE trade idea sized to the user's holding time, with a rank score (0-100)."""
     by = {r["tf"]: r for r in results}
     w = {k: v for k, v in tf_weights(style, hold_min, market).items() if k in by}
@@ -1651,17 +1655,20 @@ def build_opportunity(sym, market, results, style, hold_min, demo=False):
     if not (p0["risk"] > 0 and p0["atr"] > 0):
         opp["why_not"] = ["could not size a stop loss"]
         return opp
-    p, adapted = fit_plan(p0, side, hold_bars)
+    p, adapted = fit_plan(p0, side, hold_bars, nextday)
     a, tm = p["atr"], p["tm"]
     opp["plan"] = p
     opp["t1_min"] = max(1.0, (abs(p["t1"] - p["entry"]) / (0.7 * a)) ** 2) * tf_min
     opp["t2_min"] = max(1.0, (abs(p["t2"] - p["entry"]) / (0.7 * a)) ** 2) * tf_min
+    if nextday:
+        opp["t1_min"], opp["t2_min"] = SESSION_MIN[market] * 0.4, SESSION_MIN[market] * 0.8
     if adapted:
-        opp["note"] = "Stop and targets were fitted to your holding time (tighter stop, nearer target)."
+        opp["note"] = ("Next-session plan from the daily chart: tight stop (half the daily range), confirm the entry after the open." if nextday
+                       else "Stop and targets were fitted to your holding time (tighter stop, nearer target).")
     if tm < 1.0:
         opp["why_not"].append(f"holding time is too short for a sensible stop (reward only {tm:.1f}x risk)")
-    H = int(np.clip(round(hold_bars), 3, 300))
-    bt = backtest_plan(d, pri["sc"], side, H, hold_bars)
+    H = 1 if nextday else int(np.clip(round(hold_bars), 3, 300))
+    bt = backtest_plan(d, pri["sc"], side, H, hold_bars, nextday)
     n = bt["n"]
     pw, pl = (bt["w"] + 2.28) / (n + 6), (bt["l"] + 2.7) / (n + 6)    # shrink small samples toward a 38% / 45% prior
     exp = tm * pw - pl
@@ -1759,7 +1766,7 @@ def analyse_symbol(market, sym, style, hold_min, name=None, news=True, demo=Fals
     fb = False
     if style == "Intraday" and not any(r["kind"] == "Intraday" for r in results):
         style, hold_min, fb = "Swing", SESSION_MIN[market], True     # market closed / feed empty: analyse previous days instead
-    opp = build_opportunity(shown, market, results, style, hold_min, demo)
+    opp = build_opportunity(shown, market, results, style, hold_min, demo, nextday=fb)
     opp["fallback"] = fb
     nb = None
     if news:
@@ -1809,7 +1816,7 @@ def scan_best(market, style, hold_min, top=10, demo=False, custom=None, min_turn
         if style == "Intraday" and not any(r["kind"] == "Intraday" for r in res):
             if not res:
                 return None
-            o = build_opportunity(s, market, res, "Swing", SESSION_MIN[market], demo)   # no live candles: plan from previous days
+            o = build_opportunity(s, market, res, "Swing", SESSION_MIN[market], demo, nextday=True)   # no live candles: plan from previous days
             o["fallback"] = True
             return o
         return build_opportunity(s, market, res, style, hold_min, demo) if res else None
