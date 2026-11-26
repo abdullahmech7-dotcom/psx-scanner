@@ -146,13 +146,13 @@ def analyse(symbol, horizon='intraday', company=None, include_news=True):
     if daily is None or len(daily)<40:return None
     d=add_indicators(daily);x=d.iloc[-1];px=float(x.close);atr=float(x.atr)
     score=0;checks=[]
-    score+=20 if px>x.ema20 else -15;score+=15 if x.ema20>x.ema50 else -15;score+=10 if x.hist>0 else -10
-    score+=int(np.clip((x.rsi-50)*.45,-20,20));score+=10 if px>x.hh20 else (-10 if px<x.ll20 else 0);score+=5 if x.vol_ratio>1.5 else 0
+    score+=20 if px>float(x['ema20']) else -15;score+=15 if float(x['ema20'])>float(x['ema50']) else -15;score+=10 if float(x['hist'])>0 else -10
+    score+=int(np.clip((float(x['rsi'])-50)*.45,-20,20));score+=10 if px>float(x['hh20']) else (-10 if px<float(x['ll20']) else 0);score+=5 if pd.notna(x['vol_ratio']) and float(x['vol_ratio'])>1.5 else 0
     cp=candle_patterns(d);pat=chart_patterns(d);score+=sum(8 if b=='bull' else -8 if b=='bear' else 0 for _,b in cp);score+=sum(6 if b=='bull' else -6 if b=='bear' else 0 for _,b in pat)
     if horizon=='intraday':
         intra=fetch_intraday(symbol)
         if intra is not None and len(intra)>10:
-            ii=add_indicators(intra);z=ii.iloc[-1];score+=15 if z.close>z.ema20 else -10;score+=10 if z.hist>0 else -10;score+=8 if z.vol_ratio>1.4 else 0
+            ii=add_indicators(intra);z=ii.iloc[-1];score+=15 if float(z['close'])>float(z['ema20']) else -10;score+=10 if float(z['hist'])>0 else -10;score+=8 if pd.notna(z['vol_ratio']) and float(z['vol_ratio'])>1.4 else 0
             # session VWAP estimate
             tp=(ii.high+ii.low+ii.close)/3; day=np.asarray(ii.index.date);last=day[-1];td=ii[day==last];v=td.volume
             vwap=float((tp[day==last]*v).sum()/v.sum()) if v.sum()>0 else np.nan
@@ -167,13 +167,20 @@ def analyse(symbol, horizon='intraday', company=None, include_news=True):
     resistance=float(d.high.tail(30).max());support=float(d.low.tail(30).min())
     if side=='BUY' and resistance>px and (resistance-px)<risk:side='WATCH';checks.append('Nearby resistance may limit upside')
     if side=='BUY' and nr<=-2:side='WATCH';checks.append('Negative news-risk filter downgraded setup')
-    return {'symbol':symbol,'price':px,'score':score,'signal':side,'horizon':horizon,'entry':entry,'stop':stop,'target1':target1,'target2':target2,'risk_reward':rr,'atr':atr,'rsi':float(x.rsi),'trend':'Bullish' if px>x.ema20>x.ema50 else 'Bearish' if px<x.ema20<x.ema50 else 'Mixed','volume_ratio':float(x.vol_ratio) if pd.notna(x.vol_ratio) else 0,'candles':cp,'patterns':pat,'news':nitems,'news_risk':nr,'warnings':checks,'support':support,'resistance':resistance,'data_date':str(d.index[-1]),'daily':d,'intraday':intra}
+    return {'symbol':symbol,'price':px,'score':score,'signal':side,'horizon':horizon,'entry':entry,'stop':stop,'target1':target1,'target2':target2,'risk_reward':rr,'atr':atr,'rsi':float(x['rsi']),'trend':'Bullish' if px>x['ema20']>x['ema50'] else 'Bearish' if px<x['ema20']<x['ema50'] else 'Mixed','volume_ratio':float(x['vol_ratio']) if pd.notna(x['vol_ratio']) else 0,'candles':cp,'patterns':pat,'news':nitems,'news_risk':nr,'warnings':checks,'support':support,'resistance':resistance,'data_date':str(d.index[-1]),'daily':d,'intraday':intra}
 
 
 def scan_market(symbols=None, horizon='intraday', workers=5, include_news=True):
-    universe=list(symbols or PSX_UNIVERSE);results=[]
+    universe=list(symbols or PSX_UNIVERSE)
+    results=[]
+    # Prevent a single malformed ticker or provider response from aborting the full scan.
+    def safe_analyse(symbol):
+        try:
+            return analyse(symbol, horizon, include_news=include_news)
+        except Exception:
+            return None
     with ThreadPoolExecutor(max_workers=max(1,int(workers))) as ex:
-        futures=list(ex.map(lambda s:analyse(s,horizon,include_news=include_news),universe))
-    results=[r for r in futures if r]
-    results.sort(key=lambda r:(r['signal']=='BUY',r['score'],r['risk_reward']),reverse=True)
+        results=list(ex.map(safe_analyse, universe))
+    results=[r for r in results if r is not None]
+    results.sort(key=lambda r:(r['signal']=='BUY', r['score'], r['risk_reward']), reverse=True)
     return results
