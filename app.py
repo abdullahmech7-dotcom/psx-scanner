@@ -43,7 +43,10 @@ cur = ps.CURRENCY[market]
 mode = st.sidebar.radio("What do you want?", ["Analyse one symbol", "Find best opportunities (ranked)"])
 use_news = st.sidebar.checkbox("Include news and events", value=True)
 amount = st.sidebar.number_input(f"Example amount ({cur}), only to show profit/loss numbers", min_value=0, value=100000, step=10000)
-demo = st.sidebar.checkbox("Demo data (test only)", value=False)
+demo = st.sidebar.checkbox("Demo data (FAKE prices, test only)", value=False)
+SIG = SIG + (demo,)
+if demo:
+    st.error("⚠ DEMO MODE IS ON: all prices below are FAKE, randomly generated. Untick \"Demo data\" in the sidebar for real prices.")
 st.sidebar.caption("The trade plan does not depend on your capital. Whatever you invest, the stop loss and targets are the same in % terms.")
 if market == "PSX":
     st.sidebar.caption("PSX: only BUY / EXIT ideas (retail short selling is usually impractical).")
@@ -144,6 +147,9 @@ def render_single(out):
     st.caption(f"{chg}data to {res[0]['d'].index[-1]:%d %b %H:%M}   |   {out['style']} idea for a {hold_txt} hold")
     if out["tick_info"]:
         st.caption(out["tick_info"])
+    if out.get("fallback"):
+        st.warning("Live intraday candles are not available right now (market closed or feed empty). This idea uses PREVIOUS DAYS' "
+                   "daily chart for a 1-day hold. Confirm at the next market open.")
     for tf, w in out["why"].items():
         st.caption(f"{tf} skipped: {w}")
     t1, t2, t3, t4 = st.tabs(["🎯 Trade idea", "📊 All timeframes", "🕯 Charts and patterns", "📰 News and events"])
@@ -196,6 +202,10 @@ def render_scan(R):
     sk = ", ".join(f"{k} {v}" for k, v in R["skipped"].items() if v)
     st.caption(f"{ps.MARKETS[R['market']]}  |  {R['style']} for a {hold_txt} hold  |  scanned {len(R['uni'])}, analysed {R['n']}"
                + (f", skipped: {sk}" if sk else "") + f"  |  data to {R['last_ts']:%d %b %H:%M}  |  {R['secs']:.0f}s")
+    if R.get("fallback_n"):
+        st.warning(f"Live intraday candles were not available for {R['fallback_n']} symbols (market closed or feed empty"
+                   + (f": {R['feed_err']}" if R.get("feed_err") else "") + "). For those, the plan is built from PREVIOUS DAYS' daily chart "
+                   "(1-day hold). Confirm at the next market open.")
     t1, t2, t3 = st.tabs(["🏆 Ranked opportunities", "👀 Watchlist", "📰 Market and world news"])
     with t1:
         rk = R["ranked"]
