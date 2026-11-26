@@ -203,9 +203,10 @@ def render_scan(R):
     st.caption(f"{ps.MARKETS[R['market']]}  |  {R['style']} for a {hold_txt} hold  |  scanned {len(R['uni'])}, analysed {R['n']}"
                + (f", skipped: {sk}" if sk else "") + f"  |  data to {R['last_ts']:%d %b %H:%M}  |  {R['secs']:.0f}s")
     if R.get("fallback_n"):
-        st.warning(f"Live intraday candles were not available for {R['fallback_n']} symbols (market closed or feed empty"
-                   + (f": {R['feed_err']}" if R.get("feed_err") else "") + "). For those, the plan is built from PREVIOUS DAYS' daily chart "
-                   "(1-day hold). Confirm at the next market open.")
+        st.warning(f"5-minute candles could not be downloaded for {R['fallback_n']} symbols"
+                   + (f" ({R['feed_err']})" if R.get("feed_err") else "") + ". For those, the plan is built from ALL available daily history "
+                   "(patterns, indicators, support/resistance on the daily chart) as a NEXT-SESSION intraday plan: tight stop, nearby targets. "
+                   "Confirm the entry after the market opens.")
     t1, t2, t3 = st.tabs(["🏆 Ranked opportunities", "👀 Watchlist", "📰 Market and world news"])
     with t1:
         rk = R["ranked"]
