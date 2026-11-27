@@ -94,6 +94,36 @@ def render_news(nb, assets=True):
     st.caption("Mood is keyword-based. Read the headlines yourself, especially for intraday trades.")
 
 
+
+def show_prediction(sym, results, key, hold=None, default_tf=None):
+    """Predicted candles for the holding horizon, on any timeframe (intraday candles are simulated from daily data if needed)."""
+    hold = hold or hold_min
+    avail = {r["tf"]: r for r in results}
+    opts = list(avail)
+    sims = [f"{lab} (simulated from daily)" for lab in ("5m", "15m", "30m", "1h")] if "1D" in avail and not any(t in avail for t in ("5m", "15m")) else []
+    pick = st.selectbox("Candle timeframe to predict", opts + sims, index=(opts + sims).index(default_tf) if default_tf in (opts + sims) else 0, key=f"fcsel_{key}")
+    if pick in avail:
+        r = avail[pick]
+        fc = ps.forecast_candles(r["d"], pick, hold, market, score=r["score"])
+        hist = r["d"]
+    else:
+        lab = pick.split(" ")[0]
+        step = {"5m": 5, "15m": 15, "30m": 30, "1h": 60}[lab]
+        r = avail["1D"]
+        fc = ps.forecast_candles(r["d"], "1D", hold, market, sim_step=step, score=r["score"])
+        hist = r["d"]
+    if not fc:
+        st.info("Not enough history to simulate this timeframe.")
+        return
+    fig = ps.draw_forecast(sym, hist, fc, r["dec"])
+    st.pyplot(fig)
+    plt.close(fig)
+    st.caption(f"Next {fc['bars']} x {fc['label']} candles ({ps.fmt_dur(hold, market)}): chance up {fc['pu']:.0f}%, median move {fc['med']:+.2f}%, "
+               f"likely range (50%) {ps.fp(fc['lo'], r['dec'])} to {ps.fp(fc['hi'], r['dec'])}, wide range (80%) {ps.fp(fc['lo90'], r['dec'])} to {ps.fp(fc['hi90'], r['dec'])}. "
+               f"Built from {fc['history']:,} past candles ({fc['n_analogs']} closest look-alike situations, recent days weighted most).")
+    st.caption("This is a statistical simulation, not real future data: the candles show the most likely path, real candles will be more jagged.")
+
+
 def render_idea(o, key="x", chart=True):
     """One trade idea: headline, plan, checks, news, optional chart."""
     p, dec = o["plan"], o["dec"]
@@ -163,11 +193,14 @@ def render_single(out):
     for nt in out.get("notes", []):
         if "Yahoo" in nt:
             st.info(nt)
-    t1, t2, t3, t4 = st.tabs(["🎯 Trade idea", "📊 All timeframes", "🕯 Charts and patterns", "📰 News and events"])
+    t1, tp, t2, t3, t4 = st.tabs(["🎯 Trade idea", "🔮 Prediction", "📊 All timeframes", "🕯 Charts and patterns", "📰 News and events"])
     with t1:
         render_idea(o, "single")
         if o["daily"]:
             st.caption(f"Daily trend: {o['daily']}")
+    with tp:
+        dflt = o["tf"] if style == "Intraday" and o["tf"] in [r["tf"] for r in res] else None
+        show_prediction(sym, res, "single", default_tf=dflt)
     with t2:
         rows = []
         for r in res:
@@ -241,6 +274,9 @@ def render_scan(R):
                 with st.expander(f"#{i}  {o['grade']}  {o['sym']}  {ps.dir_name(o['market'], o['side'])}  {ps.fp(o['px'], o['dec'])}  (rank {o['rank']:.0f})",
                                  expanded=(i == 1)):
                     render_idea(o, f"rk{i}", chart=(i <= 3))
+                    if i <= 3:
+                        st.markdown("**🔮 Predicted candles for your holding time**")
+                        show_prediction(o["sym"], o["results"], f"rk{i}", default_tf=o["tf"] if style == "Intraday" and o["tf"] != "1D" else None)
                     if i > 3 and st.checkbox("Show chart", key=f"chart{i}"):
                         show_fig(o["sym"], o["chart_r"])
             csv = pd.DataFrame([dict(rank=i, symbol=o["sym"], direction=ps.dir_name(o["market"], o["side"]), grade=o["grade"], score=round(o["rank"]),
@@ -291,9 +327,8 @@ else:
     st.write(f"Scans many {ps.MARKETS[market]} symbols, builds a trade plan sized to your **{hold_txt}** holding time, and ranks the best first.")
     top = st.slider("How many top opportunities to show", 3, 20, 10)
     custom = st.text_input("Only these symbols (optional, space separated)", value="").upper().split()
-    min_turn, all_psx, limit = 0, False, 0
+    min_turn, all_psx, limit = 0.0, False, 0
     if market == "PSX":
-        min_turn = st.number_input("Min turnover last session (PKR million)", min_value=0, value=20, step=5)
         all_psx = st.checkbox("Scan ALL PSX symbols (slow, several minutes)", value=False)
         if all_psx:
             limit = int(st.number_input("Scan only first N symbols (0 = all)", min_value=0, value=0, step=50))
