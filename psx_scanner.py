@@ -1602,6 +1602,167 @@ def apply_news(opp, nb):
     return opp
 
 
+# ------------------------------------------------------------------ PREDICTED CANDLES (analog + recency-weighted simulation)
+def _step_label(m):
+    return "1D" if m >= 1440 else "1h" if m == 60 else f"{int(m)}m"
+
+
+def sim_step_for(hold_min):
+    """Candle size used to draw the prediction when only daily data exists."""
+    return 5 if hold_min <= 60 else 15 if hold_min <= 240 else 30 if hold_min <= 480 else 60
+
+
+def _next_bd(t):
+    t = t + pd.Timedelta(days=1)
+    while t.weekday() >= 5:
+        t += pd.Timedelta(days=1)
+    return t
+
+
+def future_index(start, step, bars, market, daily=False):
+    out, t = [], pd.Timestamp(start)
+    for _ in range(bars):
+        if daily:
+            t = t + pd.Timedelta(days=1)
+            while market != "Crypto" and t.weekday() >= 5:
+                t += pd.Timedelta(days=1)
+        else:
+            t = t + pd.Timedelta(minutes=step)
+            if market == "PSX":
+                op = t.normalize() + pd.Timedelta(hours=9, minutes=15)
+                cl = t.normalize() + pd.Timedelta(hours=15, minutes=30)
+                if t > cl or t.weekday() >= 5:
+                    t = (_next_bd(t.normalize()) if t.weekday() < 5 else _next_bd(t.normalize() - pd.Timedelta(days=0))) + pd.Timedelta(hours=9, minutes=15 + step)
+                elif t <= op:
+                    t = op + pd.Timedelta(minutes=step)
+            elif market == "Forex" and t.weekday() >= 5:
+                t = _next_bd(t.normalize()) if t.weekday() == 6 else _next_bd(t.normalize() + pd.Timedelta(days=1))
+        out.append(t)
+    return pd.DatetimeIndex(out)
+
+
+def forecast_candles(d, tf, horizon_min, market, sim_step=None, score=0.0, n_paths=300, seed=11):
+    """Predict the next candles for the holding horizon.
+    Method: (1) ANALOGS: past windows whose last ~20 returns look most like now, weighted toward recent history;
+            (2) recency-weighted block bootstrap of past returns; (3) small tilt from the technical score.
+    If only daily candles exist and the horizon is intraday, the daily analog distribution is scaled down to finer candles."""
+    close = d.close.values.astype(float)
+    r = np.diff(np.log(close))
+    r = r[np.isfinite(r)]
+    n = len(r)
+    native = TFS[tf][2] or SESSION_MIN[market]
+    scaled = bool(sim_step) and tf == "1D"
+    step = sim_step if scaled else native
+    bpd = SESSION_MIN[market] / step
+    bars = int(np.clip(round(horizon_min / step), 3, 150))
+    H = 1 if scaled else bars
+    if n < 40 or n < H + 25:
+        return None
+    rng = np.random.default_rng(seed)
+    hl = float(np.clip(n / 6, 10, 120))
+    w = 0.5 ** ((n - 1 - np.arange(n)) / hl)                         # yesterday / last week count more than last year
+    cs = np.r_[0.0, np.cumsum(r)]
+    L = int(min(20, max(8, n // 10)))
+    win = np.lib.stride_tricks.sliding_window_view(r, L)
+    cur = r[-L:]
+    z = win - win.mean(1, keepdims=True)
+    zc = cur - cur.mean()
+    sim = (z @ zc) / (np.sqrt((z ** 2).sum(1) * (zc ** 2).sum()) + 1e-12)
+    idx = np.arange(0, n - L - H + 1)
+    out = cs[idx[:, None] + L + np.arange(1, H + 1)] - cs[idx + L][:, None]
+    a = np.clip(sim[idx], 0, None) ** 2 * w[idx + L - 1]
+    top = np.argsort(-a)[:80]
+    paths = []
+    if a[top].sum() > 0:
+        pick = rng.choice(top, size=min(200, n_paths), p=a[top] / a[top].sum())
+        paths.append(out[pick])
+    n_an = int(len(top))
+    bs = np.empty((150, H))
+    pw = w[:n - 3] / w[:n - 3].sum()
+    for k in range(150):
+        seq = []
+        while len(seq) < H:
+            s0 = rng.choice(n - 3, p=pw)
+            seq.extend(r[s0:s0 + 4])
+        bs[k] = np.cumsum(seq[:H])
+    paths.append(bs)
+    P = np.vstack(paths)
+    sig = float(np.sqrt(np.average((r - np.average(r, weights=w)) ** 2, weights=w)))
+    tilt = (score / 100.0) * 0.10 * sig
+    if scaled:                                                       # one daily outcome -> many fine candles
+        day = P[:, 0]
+        mu, sd = float(day.mean()), float(day.std() + 1e-9)
+        steps = rng.normal(mu / bpd + tilt / np.sqrt(bpd), sd / np.sqrt(bpd), (n_paths, bars))
+        P = np.cumsum(steps, axis=1)
+    else:
+        P = P + tilt * np.arange(1, H + 1)
+    last = close[-1]
+    price = last * np.exp(P)
+    q = {k: np.quantile(price, v, axis=0) for k, v in (("q10", .10), ("q25", .25), ("q50", .50), ("q75", .75), ("q90", .90))}
+    med = q["q50"]
+    opn = np.r_[last, med[:-1]]
+    atr0 = float(d.atr.iloc[-1]) if "atr" in d.columns else float((d.high - d.low).ewm(span=14, adjust=False).mean().iloc[-1])
+    atr = atr0 / (np.sqrt(bpd) if scaled else 1.0)
+    wick = 0.25 * atr
+    ohlc = pd.DataFrame(dict(open=opn, high=np.maximum(opn, med) + wick, low=np.minimum(opn, med) - wick, close=med))
+    now = pd.Timestamp.now(tz=TZ).tz_localize(None).floor(f"{max(1, int(step))}min") if step < 1440 else d.index[-1]
+    last_ts = d.index[-1]
+    start = max(last_ts, now) if step < 1440 and not scaled and (now - last_ts) < pd.Timedelta(days=1) else (now if scaled else last_ts)
+    ohlc.index = future_index(start, step, bars, market, daily=(step >= 1440))
+    fin = price[:, -1]
+    return dict(tf=tf, label=_step_label(step), step=step, bars=bars, scaled=scaled, ohlc=ohlc, last=last, n_analogs=n_an, history=n,
+                pu=float((fin > last).mean() * 100), med=float(100 * (med[-1] / last - 1)), lo=float(q["q25"][-1]), hi=float(q["q75"][-1]),
+                lo90=float(q["q10"][-1]), hi90=float(q["q90"][-1]), **q)
+
+
+def draw_forecast(sym, hist, fc, dec=2, fig_only=True):
+    """Last candles + predicted candles with 50% and 80% probability bands."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    bg, up, dn = "#0e1117", "#22c55e", "#ef4444"
+    fig, ax = plt.subplots(figsize=(11, 5.2), facecolor=bg)
+    ax.set_facecolor(bg)
+    m = 0
+    if not fc["scaled"]:
+        h = hist.iloc[-50:]
+        m = len(h)
+        for i, (_, rw) in enumerate(h.iterrows()):
+            col = up if rw.close >= rw.open else dn
+            ax.plot([i, i], [rw.low, rw.high], color=col, lw=1)
+            ax.add_patch(Rectangle((i - .3, min(rw.open, rw.close)), .6, max(abs(rw.close - rw.open), 1e-12), color=col))
+        xt = list(range(0, m, max(1, m // 4)))
+        lab = [f"{h.index[i]:%d %b %H:%M}" if fc["step"] < 1440 else f"{h.index[i]:%d %b}" for i in xt]
+    else:
+        pr = hist.iloc[-2:-1] if len(hist) > 1 else hist
+        for nm, v, col in (("Prev high", pr.high.iloc[-1], "#94a3b8"), ("Prev low", pr.low.iloc[-1], "#94a3b8"), ("Prev close", pr.close.iloc[-1], "#60a5fa")):
+            ax.axhline(v, color=col, lw=.8, ls="--")
+            ax.text(0, v, f" {nm} {v:.{dec}f}", color=col, fontsize=7, va="bottom")
+        xt, lab = [], []
+    o = fc["ohlc"]
+    xs = np.arange(m, m + len(o))
+    ax.fill_between(np.r_[m - 1, xs], np.r_[fc["last"], fc["q10"]], np.r_[fc["last"], fc["q90"]], color="#a78bfa", alpha=.12, label="80% range")
+    ax.fill_between(np.r_[m - 1, xs], np.r_[fc["last"], fc["q25"]], np.r_[fc["last"], fc["q75"]], color="#a78bfa", alpha=.25, label="50% range")
+    for x, (_, rw) in zip(xs, o.iterrows()):
+        col = up if rw.close >= rw.open else dn
+        ax.plot([x, x], [rw.low, rw.high], color=col, lw=1, alpha=.7)
+        ax.add_patch(Rectangle((x - .3, min(rw.open, rw.close)), .6, max(abs(rw.close - rw.open), 1e-12), facecolor=col, edgecolor="#e5e7eb", alpha=.55, ls="--", lw=.6))
+    ax.axvline(m - .5, color="#64748b", ls=":", lw=1)
+    ax.text(m + len(o) / 2, ax.get_ylim()[1], "PREDICTED (simulation)", color="#c4b5fd", ha="center", va="top", fontsize=9, fontweight="bold")
+    step_x = max(1, len(o) // 4)
+    xt += [int(x) for x in xs[::step_x]]
+    lab += [f"{t:%d %b %H:%M}" if fc["step"] < 1440 else f"{t:%d %b}" for t in o.index[::step_x]]
+    ax.set_xticks(xt)
+    ax.set_xticklabels(lab, color="#94a3b8", fontsize=8)
+    ax.tick_params(colors="#94a3b8")
+    for sp in ax.spines.values():
+        sp.set_color("#2a303b")
+    ax.grid(color="#1f2430", lw=.5)
+    ax.set_title(f"{sym}  |  next {fc['bars']} x {fc['label']} candles  |  chance up {fc['pu']:.0f}%  |  median {fc['med']:+.2f}%", color="#e5e7eb", fontsize=11)
+    ax.legend(facecolor=bg, edgecolor="#2a303b", labelcolor="#cbd5e1", fontsize=8, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+
 # ---------- opportunity scoring
 def grade_of(rank):
     return "A" if rank >= 70 else "B" if rank >= 58 else "C"
