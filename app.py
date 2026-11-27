@@ -98,10 +98,21 @@ def render_news(nb, assets=True):
 def show_prediction(sym, results, key, hold=None, default_tf=None):
     """Predicted candles for the holding horizon, on any timeframe (intraday candles are simulated from daily data if needed)."""
     hold = hold or hold_min
+    if not hasattr(ps, "forecast_candles"):
+        st.error("Your psx_scanner.py on GitHub is the OLD version (it has no prediction code). Replace psx_scanner.py with the new file, "
+                 "then reboot the app (Manage app > Reboot).")
+        return
     avail = {r["tf"]: r for r in results}
     opts = list(avail)
     sims = [f"{lab} (simulated from daily)" for lab in ("5m", "15m", "30m", "1h")] if "1D" in avail and not any(t in avail for t in ("5m", "15m")) else []
     pick = st.selectbox("Candle timeframe to predict", opts + sims, index=(opts + sims).index(default_tf) if default_tf in (opts + sims) else 0, key=f"fcsel_{key}")
+    try:
+        _predict(sym, avail, pick, hold)
+    except Exception as e:
+        st.warning(f"Prediction could not be drawn for this symbol: {e}")
+
+
+def _predict(sym, avail, pick, hold):
     if pick in avail:
         r = avail[pick]
         fc = ps.forecast_candles(r["d"], pick, hold, market, score=r["score"])
