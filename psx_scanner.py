@@ -159,11 +159,69 @@ def psx_portal(kind, sym):
     return df
 
 
+
+QUOTES = {}            # PSX symbol -> latest quote (TradingView scanner), refreshed every 2 minutes
+
+
+def tv_quotes(syms):
+    """Latest quote (open/high/low/close/volume) for PSX stocks from TradingView's public scanner, one request per 100 symbols."""
+    import json
+    need = [x for x in syms if x not in QUOTES or time.time() - QUOTES[x]["t"] > 120]
+    for k in range(0, len(need), 100):
+        chunk = need[k:k + 100]
+        payload = json.dumps({"symbols": {"tickers": ["PSX:" + x for x in chunk]}, "columns": ["open", "high", "low", "close", "volume"]}).encode()
+        got, last = {}, None
+        for market in ("pakistan", "global"):
+            try:
+                req = urllib.request.Request(f"https://scanner.tradingview.com/{market}/scan", data=payload,
+                                             headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+                js = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "ignore"))
+                for row in js.get("data", []):
+                    o, h, l, c, v = row["d"]
+                    if c:
+                        got[row["s"].split(":")[-1]] = dict(open=o or c, high=max(h or c, c), low=min(l or c, c), close=c, volume=v or 0, t=time.time())
+                if got:
+                    break
+            except Exception as e:
+                last = str(e)[:80]
+        if not got and last:
+            _err(f"TradingView quotes: {last}")
+        for x in chunk:
+            QUOTES[x] = got.get(x, dict(t=time.time()))
+
+
+def overlay_live(d, sym):
+    """Patch today's live quote into the daily candles (sources often lag one day)."""
+    q = QUOTES.get(sym)
+    if d is None or not q or not q.get("close"):
+        return d
+    now = pd.Timestamp.now(tz=TZ).tz_localize(None)
+    sess = now.normalize() - (pd.Timedelta(days=1) if now.hour * 60 + now.minute < 9 * 60 + 15 else pd.Timedelta(0))
+    while sess.weekday() >= 5:
+        sess -= pd.Timedelta(days=1)
+    d = d.copy()
+    row = dict(open=q["open"], high=q["high"], low=q["low"], close=q["close"], volume=q["volume"])
+    if d.index[-1] < sess:
+        same = abs(d.close.iloc[-1] - q["close"]) < 1e-9 and abs(d.high.iloc[-1] - q["high"]) < 1e-9
+        if not same:
+            d.loc[sess] = [row.get(c, 0) for c in d.columns]
+    elif d.index[-1] == sess:
+        for c, v in row.items():
+            if c in d.columns:
+                d.iloc[-1, d.columns.get_loc(c)] = v
+    d.attrs["live"] = q
+    return d.sort_index()
+
+
 def daily_chain(sym):
     """Daily candles for one PSX stock: pypsx-toolkit -> PSX portal -> Yahoo (.KA). Returns DataFrame or None."""
     end = pd.Timestamp.today().normalize()
     start = end - pd.Timedelta(days=730)
     srcs = []
+    try:
+        tv_quotes([sym])
+    except Exception as e:
+        _err(f"TradingView quotes: {str(e)[:80]}")
     try:
         import pypsx_toolkit as pt
         t = pt.PSXTicker(sym)
@@ -177,7 +235,7 @@ def daily_chain(sym):
         try:
             cand = _norm(fn())
             if {"open", "close"} <= set(cand.columns) and len(cand) >= 20:
-                return _ohlcv(cand, allow_synth=True)
+                return overlay_live(_ohlcv(cand, allow_synth=True), sym)
         except Exception as e:
             _err(f"{name}: {str(e)[:90]}")
     return None
@@ -1751,6 +1809,17 @@ def analyse_symbol(market, sym, style, hold_min, name=None, news=True, demo=Fals
         results, why = o["results"], o["why"]
         out.update(tick_info=o["tick_info"], psess=o["psess"], notes=o["notes"])
         shown = sym
+        if not any(r["kind"] == "Intraday" for r in results) and not demo:      # PSX feeds empty: try Yahoo intraday history
+            try:
+                y = yf_frames([sym + ".KA"], "Intraday")[sym + ".KA"]
+                y.pop("1D", None)
+                ry, _ = analyse_frames(y)
+                if ry:
+                    results = sorted(results + ry, key=lambda r: list(TFS).index(r["tf"]))
+                    why = {k: v for k, v in why.items() if k not in {r["tf"] for r in ry}}
+                    out["notes"] = out["notes"] + ["Intraday candles come from Yahoo (.KA) because the PSX feeds returned nothing."]
+            except Exception as e:
+                _err(f"Yahoo intraday: {str(e)[:80]}")
     else:
         t = yf_symbol(market, sym)
         shown = show_sym(market, t)
@@ -1772,7 +1841,8 @@ def analyse_symbol(market, sym, style, hold_min, name=None, news=True, demo=Fals
     if news:
         nb = demo_news_bundle() if demo else get_news_bundle(market, shown, name)
         apply_news(opp, nb)
-    out.update(sym=shown, results=results, why=why, opp=opp, nw=nb, fallback=fb)
+    opp['live'] = QUOTES.get(shown) if market == 'PSX' else None
+    out.update(sym=shown, results=results, why=why, opp=opp, nw=nb, fallback=fb, errs=list(DATA_ERR))
     return out
 
 
@@ -1789,6 +1859,10 @@ def scan_best(market, style, hold_min, top=10, demo=False, custom=None, min_turn
         progress(0, len(uni), "Starting")
     if market == "PSX":
         done = 0
+        try:
+            tv_quotes(uni)
+        except Exception:
+            pass
         with _TPE(max_workers=workers) as ex:
             for s, (fr, why) in zip(uni, ex.map(lambda s_: psx_frames(s_, style, demo, min_turnover), uni)):
                 done += 1
