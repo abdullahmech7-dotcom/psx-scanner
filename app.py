@@ -150,8 +150,19 @@ def render_single(out):
     if out.get("fallback"):
         st.warning("Live intraday candles are not available right now (market closed or feed empty). This idea uses PREVIOUS DAYS' "
                    "daily chart for a 1-day hold. Confirm at the next market open.")
-    for tf, w in out["why"].items():
-        st.caption(f"{tf} skipped: {w}")
+    lq = o.get("live")
+    if out["market"] == "PSX":
+        if lq and lq.get("close"):
+            st.caption(f"Live price check (TradingView, {pd.Timestamp.now(tz=ps.TZ):%H:%M}): {lq['close']:,.2f}  |  today's range {lq['low']:,.2f} to {lq['high']:,.2f}. Today's candle was updated with it.")
+        else:
+            st.warning("Live price could not be fetched, so the last price may be from the previous session. "
+                       + (" | ".join(out.get("errs") or [])[:240]))
+    if out["style"] == "Intraday" or out.get("fallback"):
+        for tf, w in out["why"].items():
+            st.caption(f"{tf} skipped: {w}")
+    for nt in out.get("notes", []):
+        if "Yahoo" in nt:
+            st.info(nt)
     t1, t2, t3, t4 = st.tabs(["🎯 Trade idea", "📊 All timeframes", "🕯 Charts and patterns", "📰 News and events"])
     with t1:
         render_idea(o, "single")
